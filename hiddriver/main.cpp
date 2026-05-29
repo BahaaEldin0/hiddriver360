@@ -42,6 +42,41 @@ HANDLE MakeThread(LPTHREAD_START_ROUTINE Address, PVOID arg) {
 
 void XNotifyUI(XNOTIFYQUEUEUI_TYPE Type, PWCHAR String) { XNotifyQueueUI(Type, XUSER_INDEX_ANY, XNOTIFYUI_PRIORITY_DEFAULT, String, 0); }
 
+// --- Diagnostic file log -------------------------------------------------
+// Doing blocking file I/O directly inside a USB driver callback is risky, so
+// callbacks only append short strings to this in-memory buffer; a background
+// thread flushes it to HDD:\hiddriver_log.txt once a second. This lets users
+// without XDK/xbWatson capture what the console actually does on hotplug.
+static char g_logBuf[16384];
+static volatile int g_logLen = 0;
+
+void LogLine(const char* s) {
+	int len = (int)strlen(s);
+	int pos = g_logLen;
+	if (pos + len + 1 >= (int)sizeof(g_logBuf))
+		return; // buffer full, drop until flushed
+	memcpy(g_logBuf + pos, s, len);
+	g_logBuf[pos + len] = '\n';
+	g_logLen = pos + len + 1;
+}
+
+unsigned int __stdcall LoggerThreadProc(void* param) {
+	while (true) {
+		int len = g_logLen;
+		if (len > 0) {
+			std::ofstream f("HDD:\\hiddriver_log.txt", std::ios::app | std::ios::binary);
+			if (f.is_open()) {
+				f.write(g_logBuf, len);
+				f.flush();
+				f.close();
+				g_logLen = 0;
+			}
+		}
+		Sleep(1000);
+	}
+	return 0;
+}
+
 struct UsbTrb {
 	DWORD endpoint;
 	DWORD callback;
@@ -1364,6 +1399,20 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		interface_descriptor->bInterfaceSubClass,
 		interface_descriptor->bInterfaceProtocol);
 
+	// Diagnostic: record EVERY device the console routes to this hook, with its
+	// full interface identity, so we can see whether a GIP pad ever arrives.
+	{
+		char line[160];
+		sprintf(line,
+			"HidAddDevice vid=%04x pid=%04x class=%02x sub=%02x proto=%02x -> %s",
+			vendorId, productId,
+			interface_descriptor->bInterfaceClass,
+			interface_descriptor->bInterfaceSubClass,
+			interface_descriptor->bInterfaceProtocol,
+			isGipController ? "GIP" : (isHidController ? "HID" : "ignored(passed through)"));
+		LogLine(line);
+	}
+
 	if (isHidController || isGipController) {
 		DbgPrint("EINTIM: Controller detected (%s). Initialising custom handler.\n",
 			isGipController ? "GIP" : "HID");
@@ -1726,6 +1775,10 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 
 		// Start mapping manager thread
 		MakeThread((LPTHREAD_START_ROUTINE)MappingManagerThreadProc, nullptr);
+
+		// Start diagnostic logger thread (flushes to HDD:\hiddriver_log.txt)
+		LogLine("=== hiddriver360 GIP diagnostic build started ===");
+		MakeThread((LPTHREAD_START_ROUTINE)LoggerThreadProc, nullptr);
 	}
 	return TRUE;
 }
