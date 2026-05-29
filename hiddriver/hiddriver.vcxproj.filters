@@ -5,6 +5,7 @@
     <ClCompile Include="Detours.cpp" />
     <ClCompile Include="hid_parser.cpp" />
     <ClCompile Include="mapping.cpp" />
+    <ClCompile Include="gip.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />
@@ -14,5 +15,6 @@
     <ClInclude Include="hid_parser.h" />
     <ClInclude Include="mapping.h" />
     <ClInclude Include="usb.h" />
+    <ClInclude Include="gip.h" />
   </ItemGroup>
 </Project>
