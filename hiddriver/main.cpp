@@ -8,9 +8,10 @@
 #include <sstream>
 #include <vector>
 #include "Detours.h"
-#include "hid_parser.h"  
+#include "hid_parser.h"
 #include "usb.h"
 #include "mapping.h"
+#include "gip.h"
 
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
@@ -40,6 +41,41 @@ HANDLE MakeThread(LPTHREAD_START_ROUTINE Address, PVOID arg) {
 }
 
 void XNotifyUI(XNOTIFYQUEUEUI_TYPE Type, PWCHAR String) { XNotifyQueueUI(Type, XUSER_INDEX_ANY, XNOTIFYUI_PRIORITY_DEFAULT, String, 0); }
+
+// --- Diagnostic file log -------------------------------------------------
+// Doing blocking file I/O directly inside a USB driver callback is risky, so
+// callbacks only append short strings to this in-memory buffer; a background
+// thread flushes it to HDD:\hiddriver_log.txt once a second. This lets users
+// without XDK/xbWatson capture what the console actually does on hotplug.
+static char g_logBuf[16384];
+static volatile int g_logLen = 0;
+
+void LogLine(const char* s) {
+	int len = (int)strlen(s);
+	int pos = g_logLen;
+	if (pos + len + 1 >= (int)sizeof(g_logBuf))
+		return; // buffer full, drop until flushed
+	memcpy(g_logBuf + pos, s, len);
+	g_logBuf[pos + len] = '\n';
+	g_logLen = pos + len + 1;
+}
+
+unsigned int __stdcall LoggerThreadProc(void* param) {
+	while (true) {
+		int len = g_logLen;
+		if (len > 0) {
+			std::ofstream f("HDD:\\hiddriver_log.txt", std::ios::app | std::ios::binary);
+			if (f.is_open()) {
+				f.write(g_logBuf, len);
+				f.flush();
+				f.close();
+				g_logLen = 0;
+			}
+		}
+		Sleep(1000);
+	}
+	return 0;
+}
 
 struct UsbTrb {
 	DWORD endpoint;
@@ -261,6 +297,15 @@ enum NINTENDO_HANDSHAKE_STATE {
 	HANDSHAKE,
 	DONE
 };
+
+// How a given controller talks to us. HID covers everything the mapping
+// system handles (DS4, Switch Pro, generic HID pads). GIP covers wired
+// Xbox One / Series controllers, which are not HID and need their own path.
+enum ControllerProtocol {
+	PROTO_HID = 0,
+	PROTO_GIP = 1
+};
+
 struct Controller {
 	deviceHandle* deviceHandle;
 	HidControllerExtension* controllerDriver;
@@ -278,6 +323,10 @@ struct Controller {
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
 	UsbTrb interruptTrb;
+
+	// GIP (Xbox One / Series) specific state
+	uint8_t protocol;   // ControllerProtocol
+	uint8_t gipGuide;   // latched guide button; GIP sends it in its own frame
 } __declspec(align(4));
 
 struct MappingState {
@@ -393,11 +442,113 @@ int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
 
+// GIP init is serialized through the single global init path, so we can stash
+// the OUT endpoint here to chain the second (Xbox One S / Series) init packet
+// once the power-on packet has been sent.
+deviceHandle* g_gipInitHandle = nullptr;
+UsbTrb* g_gipInitTrb = nullptr;
+
+int32_t gipPowerOnComplete(DWORD deviceHandle, int32_t status) {
+	if (g_gipInitHandle && g_gipInitTrb) {
+		SendInterruptRequest(g_gipInitHandle, g_gipInitTrb,
+			(void*)GIP_S_INIT, sizeof(GIP_S_INIT), (DWORD)noopCompleteHandler);
+		g_gipInitHandle = nullptr;
+		g_gipInitTrb = nullptr;
+	}
+	return 0;
+}
+
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
 	DbgPrint("EINTIM: Control transfer completed.\n");
 
 	if (g_InitState == InitState::INIT_SET_CONFIGURATION) {
+		// GIP (Xbox One / Series) controllers have no HID report descriptor to
+		// fetch. Skip the HID descriptor stages, open the interrupt endpoints,
+		// power the pad on so it starts streaming, then register it in XAM.
+		if (c.protocol == PROTO_GIP) {
+			DbgPrint("EINTIM: GIP init. SET_CONFIGURATION done, bringing up GIP pad\r\n");
+			g_InitState = InitState::INIT_DONE;
+
+			usb_endpoint_descriptor* in_ep = UsbdGetEndpointDescriptor(
+				controllerDriver->deviceHandle, 0,
+				USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_IN);
+
+			if (!in_ep) {
+				DbgPrint("EINTIM: GIP missing interrupt IN endpoint!\r\n");
+				g_InitState = InitState::INIT_FAILED;
+				return -1;
+			}
+
+			status = UsbdOpenEndpoint(
+				controllerDriver->deviceHandle,
+				3,
+				in_ep->bEndpointAddress,
+				swap_endianness_16(in_ep->wMaxPacketSize) & 0x7FF,
+				in_ep->bInterval,
+				(DWORD*)&controllerDriver->interruptTrb);
+
+			if (NT_ERROR(status)) {
+				DbgPrint("EINTIM: GIP failed to open interrupt IN endpoint %x!\n", status);
+				return status;
+			}
+
+			uint16_t pktSize = swap_endianness_16(in_ep->wMaxPacketSize) & 0x7FF;
+			c.reportData = malloc(pktSize * 2);
+			memset(c.reportData, 0, pktSize * 2);
+
+			controllerDriver->interruptTrb.savedEndpoint = controllerDriver->interruptTrb.endpoint;
+			controllerDriver->interruptTrb.length = pktSize;
+			controllerDriver->interruptTrb.callback = (DWORD)interruptHandler;
+			controllerDriver->interruptTrb.buffer = c.reportData;
+
+			c.controllerDriver = controllerDriver;
+
+			uint8_t  userIndex = -1;
+			uint32_t context = 0x0000000010000005 + globalIndex;
+			XamUserBindDeviceCallback(0xa7553952 + globalIndex, context, 0, false, &userIndex);
+			c.userIndex = userIndex;
+			c.deviceContext = context;
+			connectedControllers[globalIndex] = c;
+
+			DbgPrint("EINTIM: Registered virtual GIP controller in XAM index %d.\n", userIndex);
+
+			// Power the pad on via the interrupt OUT endpoint so it starts
+			// streaming 0x20 input frames. Reuse the per controller OUT trb.
+			usb_endpoint_descriptor* out_ep = UsbdGetEndpointDescriptor(
+				controllerDriver->deviceHandle, 0,
+				USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_OUT);
+
+			if (out_ep) {
+				NTSTATUS outStatus = UsbdOpenEndpoint(
+					controllerDriver->deviceHandle,
+					3,
+					out_ep->bEndpointAddress,
+					swap_endianness_16(out_ep->wMaxPacketSize) & 0x7FF,
+					out_ep->bInterval,
+					(DWORD*)&connectedControllers[globalIndex].interruptTrb);
+
+				if (!NT_ERROR(outStatus)) {
+					// Send power-on, then chain the S/Series init packet from
+					// its completion handler.
+					g_gipInitHandle = controllerDriver->deviceHandle;
+					g_gipInitTrb = &connectedControllers[globalIndex].interruptTrb;
+					SendInterruptRequest(controllerDriver->deviceHandle,
+						&connectedControllers[globalIndex].interruptTrb,
+						(void*)GIP_POWER_ON, sizeof(GIP_POWER_ON),
+						(DWORD)gipPowerOnComplete);
+				}
+				else {
+					DbgPrint("EINTIM: GIP failed to open interrupt OUT endpoint %x!\n", outStatus);
+				}
+			}
+			else {
+				DbgPrint("EINTIM: GIP missing interrupt OUT endpoint, skipping power-on\r\n");
+			}
+
+			return UsbdQueueAsyncTransfer(controllerDriver->deviceHandle, &controllerDriver->interruptTrb);
+		}
+
 		g_InitState = InitState::INIT_GET_HID_DESCRIPTOR;
 		DbgPrint("EINTIM: Init Stage 1. SET_CONFIGURATION completed successfully\r\n");
 		SendControlRequest(
@@ -992,6 +1143,30 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 		}
 	}
 
+	if (index == -1)
+		return UsbdQueueAsyncTransfer(driverExtension->deviceHandle, &driverExtension->interruptTrb);
+
+	// GIP (Xbox One / Series) controllers do not use HID reports or the mapping
+	// system; decode their fixed binary frames directly.
+	if (connectedControllers[index].protocol == PROTO_GIP) {
+		const uint8_t* data = (const uint8_t*)report;
+
+		if (data[0] == GIP_CMD_INPUT) {
+			ButtonsReport buttonReport;
+			memset(&buttonReport, 0, sizeof(ButtonsReport));
+			GipDecodeInput(data, &buttonReport, connectedControllers[index].gipGuide);
+			connectedControllers[index].currentState = buttonReport;
+		}
+		else if (data[0] == GIP_CMD_GUIDE) {
+			// Guide arrives in its own frame; latch it and patch current state.
+			uint8_t guide = GipDecodeGuide(data);
+			connectedControllers[index].gipGuide = guide;
+			connectedControllers[index].currentState.xbox = guide;
+		}
+
+		return UsbdQueueAsyncTransfer(driverExtension->deviceHandle, &driverExtension->interruptTrb);
+	}
+
 	if (NeedsNintendoHandshake(connectedControllers[index].vendorId, connectedControllers[index].productId) && connectedControllers[index].nintendo_handshake_state != DONE) {
 		if (connectedControllers[index].nintendo_handshake_state == INITIAL) {
 			DbgPrint("EINTIM: Gotta do nintendo handshake for this one!\r\n");
@@ -1214,10 +1389,33 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	DbgPrint("EINTIM: USB device descriptor Pointer: %p\n", device_descriptor);
 	DbgPrint("EINTIM: HID device vendor id: %x, product id: %x\n", vendorId, productId);
 
-	if (interface_descriptor->bInterfaceClass == 0x03 &&
+	bool isHidController =
+		interface_descriptor->bInterfaceClass == 0x03 &&
 		interface_descriptor->bInterfaceSubClass == 0 &&
-		interface_descriptor->bInterfaceProtocol == 0) {
-		DbgPrint("EINTIM: Controller detected. Initialising custom handler.\n");
+		interface_descriptor->bInterfaceProtocol == 0;
+
+	bool isGipController = GipIsInterface(
+		interface_descriptor->bInterfaceClass,
+		interface_descriptor->bInterfaceSubClass,
+		interface_descriptor->bInterfaceProtocol);
+
+	// Diagnostic: record EVERY device the console routes to this hook, with its
+	// full interface identity, so we can see whether a GIP pad ever arrives.
+	{
+		char line[160];
+		sprintf(line,
+			"HidAddDevice vid=%04x pid=%04x class=%02x sub=%02x proto=%02x -> %s",
+			vendorId, productId,
+			interface_descriptor->bInterfaceClass,
+			interface_descriptor->bInterfaceSubClass,
+			interface_descriptor->bInterfaceProtocol,
+			isGipController ? "GIP" : (isHidController ? "HID" : "ignored(passed through)"));
+		LogLine(line);
+	}
+
+	if (isHidController || isGipController) {
+		DbgPrint("EINTIM: Controller detected (%s). Initialising custom handler.\n",
+			isGipController ? "GIP" : "HID");
 		int index = -1;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
 			if (!connectedControllers[i].controllerDriver) {
@@ -1239,7 +1437,10 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		c.reportInfo = nullptr;   // will be filled in INIT_GET_REPORT_DESCRIPTOR
 		c.vendorId = vendorId;
 		c.productId = productId;
-		c.map = FindMapping(vendorId, productId);
+		c.protocol = isGipController ? PROTO_GIP : PROTO_HID;
+		c.gipGuide = 0;
+		// GIP pads are handled natively; the HID mapping system does not apply.
+		c.map = isGipController ? nullptr : FindMapping(vendorId, productId);
 		c.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
 
 		HidControllerExtension* controllerDriver = new HidControllerExtension();
@@ -1574,6 +1775,10 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 
 		// Start mapping manager thread
 		MakeThread((LPTHREAD_START_ROUTINE)MappingManagerThreadProc, nullptr);
+
+		// Start diagnostic logger thread (flushes to HDD:\hiddriver_log.txt)
+		LogLine("=== hiddriver360 GIP diagnostic build started ===");
+		MakeThread((LPTHREAD_START_ROUTINE)LoggerThreadProc, nullptr);
 	}
 	return TRUE;
 }
