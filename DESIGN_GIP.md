@@ -4,10 +4,17 @@ This document maps out how HidDriver360 works today and how wired Xbox One /
 Xbox Series controller support was added on top of it. It is the reference for
 anyone testing, debugging, or extending the GIP path.
 
-> **Status:** implemented but **untested on hardware**. The driver cannot be
-> built or run in CI — it needs the leaked Xbox 360 SDK, Visual Studio 2010,
-> and a modded console. Treat everything below the "Implementation" heading as
-> "compiles in principle, needs on-console verification."
+> **Status: DO NOT EXPECT THIS TO WORK AS-IS.** The protocol layer (init
+> handshake + frame decoding) is now verified correct against the Linux `xpad`
+> driver. **But the device-acquisition layer is an unsolved blocker** (see §5):
+> on a stock console the kernel will never hand a GIP controller to our hook,
+> because no Xbox 360 USB driver binds vendor-class (`0xFF`) devices. Solving
+> that requires reverse-engineering the specific kernel build — it cannot be
+> done blind. The code here is the correct *back half*; the *front half*
+> (getting the device to us) still needs RE work on hardware.
+>
+> The driver also cannot be built or run in CI — it needs the leaked Xbox 360
+> SDK, Visual Studio 2010, and a modded console.
 
 ---
 
@@ -170,22 +177,44 @@ compile `gip.cpp` and include `gip.h`.
 
 ---
 
-## 5. Open items to verify on hardware
+## 5. THE BLOCKER: device acquisition (resolved by research → confirmed NOT solved)
 
-These are the things that genuinely cannot be settled without a console:
+**`HidAddDevice` will not fire for a GIP controller.** This was the open
+question; web research settled it:
 
-1. **Does `HidAddDevice` even fire for a vendor-class (`0xFF`) device?**
-   This is the single biggest risk. The hook is on the *HID class driver's*
-   add-device routine. The 360's `Usbd` only routes a device there if a class
-   driver claims it; a GIP pad may instead land on an **unrecognized port**
-   (note the `UsbdTitleDriverSetUnrecognizedPort` /
-   `...ResetAllUnrecognizedPorts` kernel exports) and never reach our hook.
-   - **If it fires:** the current branch is sufficient.
-   - **If it does not:** we additionally need to intercept device matching at
-     the `Usbd` level — e.g. hook `UsbdGetRequiredDrivers` to claim class `0xFF`
-     for the HID driver, or force the port via the unrecognized-port path —
-     *before* `HidAddDevice` can be reached. This is a follow-up task and does
-     not change the decode/translation code above.
+- USB class drivers bind by interface class. The kernel HID class driver (the
+  one whose add-device routine we hook) binds **only** to interface class
+  `0x03`. The 360 controller itself is class `0xFF/0x5D/0x01` and is handled by
+  a *separate* XUSB/gamepad driver — and that driver matches `0x5D/0x01`, not
+  the GIP triple `0x47/0xD0`. A wired Xbox One/Series pad (`0xFF/0x47/0xD0`)
+  therefore matches **no** driver on the console and lands on an unrecognized
+  port (`UsbdTitleDriverSetUnrecognizedPort` / `...ResetAllUnrecognizedPorts`).
+- Corroborated by community practice: the only documented way to use Xbox
+  One/Series pads on a 360 today is a **hardware adapter** (e.g. Mayflash
+  Magic-X/Magic-NS in XInput mode) that converts GIP into a native XInput
+  controller. There is no known software-only GIP path. `hiddriver360` works
+  for DS4/DualSense/Switch Pro precisely because those are HID-class (`0x03`)
+  devices the HID driver *does* bind.
+
+### What it would take to actually acquire the device
+
+This is the real work, and it requires IDA/Ghidra on the exact dashboard kernel
+(17559 retail / 17489 devkit) — it cannot be produced blind:
+
+1. **Hook USB driver matching.** Find the `Usbd` routine that selects a driver
+   for a freshly enumerated device (candidate: `UsbdGetRequiredDrivers`,
+   ordinal 754, resolvable at runtime via `XexGetProcedureAddress` like the
+   other USB functions). Detour it so a `0xFF/0x47/0xD0` device is claimed by
+   the HID driver — then our existing `HidAddDeviceHook` fires for it.
+2. **Or register our own driver object** via `UsbdRegisterDriverObject`
+   (ordinal 755) matching the GIP class. Needs the driver-object struct layout.
+3. **Or hook the unrecognized-port path** and drive enumeration ourselves.
+
+Until one of these is in place, the GIP branch added in this PR is **dead code
+on hardware** — correct, but never reached. The decode/init layer does not
+change once acquisition is solved.
+
+### Lower-risk items (only matter once acquisition works)
 
 2. **Interrupt OUT endpoint** — confirm Xbox One/Series interface 0 actually
    exposes an interrupt OUT endpoint and that `UsbdGetEndpointDescriptor(..,

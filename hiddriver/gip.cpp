@@ -1,7 +1,10 @@
 #include "gip.h"
 
-// cmd=0x05 (power), flags=0x20 (internal/system), seq=0x00, len=0x01, ON=0x01.
+// cmd=0x05 (power), flags=0x20 (internal/system), seq=0x00, len=0x01, ON=0x00.
 const uint8_t GIP_POWER_ON[5] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
+
+// Xbox One S / Series follow-up init (xpad: xboxone_s_init).
+const uint8_t GIP_S_INIT[5] = { 0x05, 0x20, 0x00, 0x0f, 0x06 };
 
 bool GipIsInterface(uint8_t cls, uint8_t sub, uint8_t proto) {
 	return cls == GIP_INTERFACE_CLASS &&

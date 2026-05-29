@@ -407,6 +407,22 @@ int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
 
+// GIP init is serialized through the single global init path, so we can stash
+// the OUT endpoint here to chain the second (Xbox One S / Series) init packet
+// once the power-on packet has been sent.
+deviceHandle* g_gipInitHandle = nullptr;
+UsbTrb* g_gipInitTrb = nullptr;
+
+int32_t gipPowerOnComplete(DWORD deviceHandle, int32_t status) {
+	if (g_gipInitHandle && g_gipInitTrb) {
+		SendInterruptRequest(g_gipInitHandle, g_gipInitTrb,
+			(void*)GIP_S_INIT, sizeof(GIP_S_INIT), (DWORD)noopCompleteHandler);
+		g_gipInitHandle = nullptr;
+		g_gipInitTrb = nullptr;
+	}
+	return 0;
+}
+
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
 	DbgPrint("EINTIM: Control transfer completed.\n");
@@ -478,10 +494,14 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 					(DWORD*)&connectedControllers[globalIndex].interruptTrb);
 
 				if (!NT_ERROR(outStatus)) {
+					// Send power-on, then chain the S/Series init packet from
+					// its completion handler.
+					g_gipInitHandle = controllerDriver->deviceHandle;
+					g_gipInitTrb = &connectedControllers[globalIndex].interruptTrb;
 					SendInterruptRequest(controllerDriver->deviceHandle,
 						&connectedControllers[globalIndex].interruptTrb,
 						(void*)GIP_POWER_ON, sizeof(GIP_POWER_ON),
-						(DWORD)noopCompleteHandler);
+						(DWORD)gipPowerOnComplete);
 				}
 				else {
 					DbgPrint("EINTIM: GIP failed to open interrupt OUT endpoint %x!\n", outStatus);

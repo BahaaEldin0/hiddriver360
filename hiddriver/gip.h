@@ -48,13 +48,17 @@
 #define GIP_BTN_LS          (1 << 6)  // left stick click
 #define GIP_BTN_RS          (1 << 7)  // right stick click
 
-// guide frame bit (data[4] of a 0x07 frame)
-#define GIP_BTN_GUIDE  (1 << 0)
+// guide frame bit (data[4] of a 0x07 frame). xpad masks bits 0-1.
+#define GIP_BTN_GUIDE  0x03
 
 // Power-on command. Sent on the interrupt OUT endpoint, this makes the pad
 // start streaming 0x20 input frames. Layout: cmd, flags, sequence, payload
 // length, payload(power=ON). Works for wired Xbox One and Series pads.
 extern const uint8_t GIP_POWER_ON[5];
+
+// Follow-up init required by Xbox One S / Elite 2 / Series pads before they
+// stream input. Sent right after the power-on packet completes.
+extern const uint8_t GIP_S_INIT[5];
 
 // True if the given interface triple identifies a GIP gamepad.
 bool GipIsInterface(uint8_t cls, uint8_t sub, uint8_t proto);
